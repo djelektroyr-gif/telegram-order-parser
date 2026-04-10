@@ -2,78 +2,82 @@ import asyncio
 import logging
 import re
 from telethon import TelegramClient, errors
-from telethon.tl.types import Channel, Chat, User
 from config import (
-    API_ID, API_HASH, TARGET_CHATS, 
-    HIRING_KEYWORDS, PAYMENT_KEYWORDS, URGENT_KEYWORDS, EXCLUDE_WORDS
+    API_ID, API_HASH, TARGET_CHATS,
+    HELPER_KEYWORDS, HIRING_VERBS, ONE_TIME_JOB_KEYWORDS, PAYMENT_INDICATORS,
+    EXCLUDE_CATEGORIES, STOP_PHRASES
 )
 from db import is_message_sent, mark_message_sent
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def clean_message_text(text: str) -> str:
-    """Очищает текст от лишних пробелов и переносов"""
-    if not text:
-        return ""
-    text = re.sub(r'\n{3,}', '\n\n', text)
-    text = text.strip()
-    return text
-
-def is_relevant_message(text: str) -> tuple[bool, dict]:
+def is_helper_message(text: str) -> tuple[bool, str, list]:
     """
-    Новая логика проверки:
-    1. Должно быть хотя бы одно слово из HIRING_KEYWORDS
-    2. Должно быть либо слово из PAYMENT_KEYWORDS, либо слово из URGENT_KEYWORDS
-    3. Не должно быть слов из EXCLUDE_WORDS
+    Строгая проверка: сообщение ТОЛЬКО про хелперов/промоутеров/аниматоров и т.д.
+    
+    Возвращает: (релевантно, причина, найденные ключевые слова)
     """
     if not text:
-        return False, {}
+        return False, "empty", []
     
     text_lower = text.lower()
     
-    # Проверяем исключения ПЕРВЫМ ДЕЛОМ
-    found_excludes = [ex for ex in EXCLUDE_WORDS if ex.lower() in text_lower]
-    if found_excludes:
-        logger.debug(f"  🚫 Отфильтровано по исключениям: {found_excludes}")
-        return False, {"excludes": found_excludes}
+    # ШАГ 1: Проверяем стоп-фразы (исключаем сразу)
+    for phrase in STOP_PHRASES:
+        if phrase.lower() in text_lower:
+            return False, f"stop_phrase: {phrase}", []
     
-    # Ищем ключевые слова найма
-    found_hiring = [kw for kw in HIRING_KEYWORDS if kw.lower() in text_lower]
+    # ШАГ 2: Проверяем, что это НЕ творческая профессия
+    for category in EXCLUDE_CATEGORIES:
+        if category.lower() in text_lower:
+            # Дополнительная проверка: если есть "хелпер" или "промоутер" — оставляем
+            if not any(hw in text_lower for hw in ["хелпер", "хэлпер", "промоутер", "аниматор", "грузчик"]):
+                return False, f"excluded_category: {category}", []
     
-    # Ищем ключевые слова оплаты
-    found_payment = [kw for kw in PAYMENT_KEYWORDS if kw.lower() in text_lower]
+    # ШАГ 3: Ищем прямые указания на хелперов
+    found_helpers = [hw for hw in HELPER_KEYWORDS if hw.lower() in text_lower]
     
-    # Ищем ключевые слова срочности
-    found_urgent = [kw for kw in URGENT_KEYWORDS if kw.lower() in text_lower]
+    # ШАГ 4: Ищем глаголы найма
+    found_hiring = [hv for hv in HIRING_VERBS if hv.lower() in text_lower]
     
-    # Условия релевантности:
-    # 1. Обязательно наличие слов найма
-    if not found_hiring:
-        return False, {"reason": "no_hiring"}
+    # ШАГ 5: Ищем признаки разовой работы
+    found_one_time = [ot for ot in ONE_TIME_JOB_KEYWORDS if ot.lower() in text_lower]
     
-    # 2. Должна быть либо оплата, либо срочность
-    has_payment_or_urgent = bool(found_payment) or bool(found_urgent)
+    # ШАГ 6: Ищем признаки оплаты
+    found_payment = [pi for pi in PAYMENT_INDICATORS if pi.lower() in text_lower]
     
-    if not has_payment_or_urgent:
-        return False, {"reason": "no_payment_no_urgent", "hiring": found_hiring}
+    # ЛОГИКА ПРИНЯТИЯ РЕШЕНИЯ:
+    # Вариант А: Прямое указание на хелпера/промоутера + глагол найма
+    if found_helpers and found_hiring:
+        return True, "helper_plus_hiring", found_helpers + found_hiring[:2]
     
-    # Сообщение релевантно!
-    info = {
-        "hiring": found_hiring,
-        "payment": found_payment,
-        "urgent": found_urgent,
-    }
+    # Вариант Б: Прямое указание на хелпера + признак разовой работы
+    if found_helpers and found_one_time:
+        return True, "helper_plus_one_time", found_helpers + found_one_time[:2]
     
-    logger.info(f"  ✅ Найм: {found_hiring[:2]}, Оплата: {found_payment[:1] if found_payment else 'нет'}, Срочность: {found_urgent[:1] if found_urgent else 'нет'}")
+    # Вариант В: Прямое указание на хелпера + оплата
+    if found_helpers and found_payment:
+        return True, "helper_plus_payment", found_helpers + found_payment[:2]
     
-    return True, info
+    # Вариант Г: Глагол найма + "хелпер" в тексте (даже если не в HELPER_KEYWORDS)
+    if found_hiring and "хелпер" in text_lower:
+        return True, "hiring_plus_helper_text", found_hiring + ["хелпер"]
+    
+    # Вариант Д: Глагол найма + "промоутер" в тексте
+    if found_hiring and "промоутер" in text_lower:
+        return True, "hiring_plus_promoter_text", found_hiring + ["промоутер"]
+    
+    # Если ничего не подошло — не релевантно
+    return False, "no_match", []
 
-def get_message_link(chat_id: int, message_id: int, is_private: bool = False) -> str:
-    """Формирует корректную ссылку на сообщение"""
+def clean_message_text(text: str) -> str:
+    if not text:
+        return ""
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+def get_message_link(chat_id: int, message_id: int) -> str:
     str_id = str(chat_id)
     if str_id.startswith('-100'):
         clean_id = str_id[4:]
@@ -81,91 +85,18 @@ def get_message_link(chat_id: int, message_id: int, is_private: bool = False) ->
     elif str_id.startswith('-'):
         clean_id = str_id[1:]
         return f"https://t.me/c/{clean_id}/{message_id}"
-    else:
-        return f"https://t.me/c/{chat_id}/{message_id}"
+    return f"https://t.me/c/{chat_id}/{message_id}"
 
 async def safe_get_entity(client: TelegramClient, chat_link: str):
-    """Безопасно получает entity чата с обработкой ошибок"""
     try:
         entity = await client.get_entity(chat_link)
         await asyncio.sleep(1)
         return entity
-    except errors.FloodWaitError as e:
-        logger.warning(f"⚠️ Flood wait для {chat_link}: {e.seconds} секунд")
-        await asyncio.sleep(e.seconds)
-        return await client.get_entity(chat_link)
     except Exception as e:
-        logger.error(f"❌ Ошибка получения entity для {chat_link}: {type(e).__name__}")
+        logger.error(f"❌ {chat_link}: {type(e).__name__}")
         return None
 
-async def process_single_chat(client: TelegramClient, chat_link: str, limit_per_chat: int) -> list:
-    """Обрабатывает один чат и возвращает список найденных релевантных сообщений"""
-    results = []
-    
-    entity = await safe_get_entity(client, chat_link)
-    if not entity:
-        logger.warning(f"⏭️ Пропускаем чат: {chat_link}")
-        return results
-    
-    chat_id = entity.id
-    chat_title = getattr(entity, 'title', None) or getattr(entity, 'first_name', 'Без названия')
-    
-    try:
-        message_count = 0
-        relevant_count = 0
-        
-        async for message in client.iter_messages(entity, limit=limit_per_chat):
-            message_count += 1
-            
-            if not message.text:
-                continue
-            
-            message_id = str(message.id)
-            
-            # Проверяем, не отправляли ли мы уже это сообщение
-            if is_message_sent(message_id, str(chat_id)):
-                continue
-            
-            # Проверяем релевантность
-            is_relevant, info = is_relevant_message(message.text)
-            
-            if not is_relevant:
-                continue
-            
-            relevant_count += 1
-            
-            cleaned_text = clean_message_text(message.text)
-            message_link = get_message_link(chat_id, message.id)
-            
-            result = {
-                "chat_title": chat_title,
-                "chat_link": chat_link,
-                "chat_id": str(chat_id),
-                "message_id": message_id,
-                "message_text": cleaned_text,
-                "message_link": message_link,
-                "message_date": message.date.isoformat() if message.date else None,
-                "hiring_keywords": info.get("hiring", [])[:3],
-            }
-            results.append(result)
-            
-            mark_message_sent(message_id, str(chat_id))
-            logger.info(f"  ✅ НАЙДЕНО: {chat_title} - {cleaned_text[:80]}...")
-            
-            await asyncio.sleep(0.3)
-        
-        if relevant_count > 0:
-            logger.info(f"  📊 {chat_title}: проверено {message_count}, найдено {relevant_count}")
-        
-        await asyncio.sleep(2)
-        
-    except Exception as e:
-        logger.error(f"❌ Ошибка обработки чата {chat_link}: {type(e).__name__}")
-    
-    return results
-
-async def get_new_messages(limit_per_chat: int = 50) -> list:
-    """Получает новые релевантные сообщения из всех чатов"""
+async def get_new_messages(limit_per_chat: int = 30) -> list:
     client = TelegramClient('user_session', API_ID, API_HASH)
     all_results = []
     
@@ -173,135 +104,114 @@ async def get_new_messages(limit_per_chat: int = 50) -> list:
         await client.start()
         logger.info("✅ Telethon client started")
         
-        me = await client.get_me()
-        logger.info(f"👤 Авторизован как: {me.first_name}")
+        logger.info(f"🎯 ИЩЕМ ТОЛЬКО: {', '.join(HELPER_KEYWORDS[:10])}...")
+        logger.info(f"🚫 ИСКЛЮЧАЕМ: {', '.join(EXCLUDE_CATEGORIES[:10])}...")
         
-        logger.info(f"🔑 Ключевые слова найма: {len(HIRING_KEYWORDS)}")
-        logger.info(f"💵 Ключевые слова оплаты: {len(PAYMENT_KEYWORDS)}")
-        logger.info(f"⚡ Ключевые слова срочности: {len(URGENT_KEYWORDS)}")
-        logger.info(f"🚫 Исключений: {len(EXCLUDE_WORDS)}")
-        
-        total_chats = len(TARGET_CHATS)
-        logger.info(f"📋 Начинаю обработку {total_chats} чатов...")
-        
-        for idx, chat_link in enumerate(TARGET_CHATS, 1):
-            logger.info(f"🔄 Обработка чата [{idx}/{total_chats}]: {chat_link}")
+        for chat_link in TARGET_CHATS:
+            entity = await safe_get_entity(client, chat_link)
+            if not entity:
+                continue
             
-            chat_results = await process_single_chat(client, chat_link, limit_per_chat)
-            all_results.extend(chat_results)
+            chat_title = getattr(entity, 'title', None) or 'Без названия'
+            chat_id = str(entity.id)
             
-        logger.info(f"🏁 Парсинг завершён. Всего найдено {len(all_results)} новых сообщений")
+            async for message in client.iter_messages(entity, limit=limit_per_chat):
+                if not message.text:
+                    continue
+                
+                message_id = str(message.id)
+                
+                # Проверяем, не обработано ли уже
+                if is_message_sent(message_id, chat_id):
+                    continue
+                
+                # СТРОГАЯ ПРОВЕРКА НА ХЕЛПЕРА
+                is_relevant, reason, keywords = is_helper_message(message.text)
+                
+                if not is_relevant:
+                    continue
+                
+                cleaned_text = clean_message_text(message.text)
+                message_link = get_message_link(entity.id, message.id)
+                
+                result = {
+                    "chat_title": chat_title,
+                    "message_text": cleaned_text,
+                    "message_link": message_link,
+                    "keywords": keywords[:5],
+                    "reason": reason,
+                }
+                all_results.append(result)
+                
+                mark_message_sent(message_id, chat_id)
+                logger.info(f"✅ {chat_title}: {cleaned_text[:60]}... (причина: {reason})")
+                
+                await asyncio.sleep(0.3)
+            
+            await asyncio.sleep(2)
+        
+        logger.info(f"🏁 Найдено хелперов: {len(all_results)}")
         
     except Exception as e:
-        logger.error(f"❌ Критическая ошибка: {type(e).__name__}: {e}")
-    
+        logger.error(f"❌ Ошибка: {e}")
     finally:
         if client.is_connected():
             await client.disconnect()
-            logger.info("🔌 Telethon client disconnected")
     
     return all_results
 
-# Функция для тестирования
+# Тестовая функция
 async def test_filter(chat_link: str, limit: int = 30):
-    """Тестирует новую логику фильтрации на конкретном чате"""
     client = TelegramClient('user_session', API_ID, API_HASH)
     
     try:
         await client.start()
         logger.info(f"\n{'='*60}")
-        logger.info(f"🧪 ТЕСТИРОВАНИЕ НОВОЙ ЛОГИКИ ФИЛЬТРАЦИИ")
-        logger.info(f"📌 Чат: {chat_link}")
+        logger.info(f"🧪 ТЕСТ ФИЛЬТРА ХЕЛПЕРОВ: {chat_link}")
         logger.info(f"{'='*60}\n")
         
         entity = await safe_get_entity(client, chat_link)
         if not entity:
             return
         
-        chat_title = getattr(entity, 'title', 'Без названия')
-        
-        checked = 0
-        relevant = 0
-        false_positive = 0
+        passed = 0
+        blocked = 0
         
         async for message in client.iter_messages(entity, limit=limit):
             if not message.text:
                 continue
             
-            checked += 1
-            is_rel, info = is_relevant_message(message.text)
+            is_rel, reason, keywords = is_helper_message(message.text)
             
             if is_rel:
-                relevant += 1
-                status = "✅ ОТПРАВЛЕНО БЫ"
+                passed += 1
+                logger.info(f"✅ [{reason}] {message.text[:80]}...")
+                logger.info(f"   Ключевые слова: {keywords}")
             else:
-                # Проверяем, сработало бы по старой логике?
-                text_lower = message.text.lower()
-                old_logic = any(kw in text_lower for kw in ['сегодня', 'завтра', 'оплата', 'ставка'])
-                if old_logic and not is_rel:
-                    false_positive += 1
-                    status = "🟡 ОТФИЛЬТРОВАНО (раньше бы отправилось)"
-                else:
-                    status = "❌ НЕРЕЛЕВАНТНО"
-            
-            logger.info(f"\n📝 Сообщение {message.id}:")
-            logger.info(f"   Текст: {message.text[:100]}...")
-            logger.info(f"   Статус: {status}")
-            
-            if info.get("hiring"):
-                logger.info(f"   🔑 Найм: {info['hiring']}")
-            else:
-                logger.info(f"   🔑 Найм: НЕТ")
-                
-            if info.get("payment"):
-                logger.info(f"   💵 Оплата: {info['payment']}")
-            if info.get("urgent"):
-                logger.info(f"   ⚡ Срочность: {info['urgent']}")
-            if info.get("excludes"):
-                logger.info(f"   🚫 Исключения: {info['excludes']}")
-            
-            logger.info("-" * 40)
+                blocked += 1
+                logger.debug(f"❌ [{reason}] {message.text[:80]}...")
         
         logger.info(f"\n{'='*60}")
-        logger.info(f"📊 ИТОГИ:")
-        logger.info(f"   Проверено сообщений: {checked}")
-        logger.info(f"   Релевантных (будут отправлены): {relevant}")
-        logger.info(f"   Отфильтровано ложных срабатываний: {false_positive}")
+        logger.info(f"📊 ПРОПУЩЕНО: {passed} | ОТСЕЯНО: {blocked}")
         logger.info(f"{'='*60}")
         
     except Exception as e:
         logger.error(f"❌ Ошибка: {e}")
-    
     finally:
         if client.is_connected():
             await client.disconnect()
 
 if __name__ == "__main__":
-    async def main_test():
+    async def main():
         from db import init_db
         init_db()
         
-        print("\n" + "="*60)
-        print("🧪 ТЕСТИРОВАНИЕ ПАРСЕРА")
-        print("="*60)
-        print("\n1. Полный парсинг всех чатов")
-        print("2. Тест фильтрации на одном чате")
-        
-        choice = input("\nВыберите режим (1/2): ").strip()
-        
+        choice = input("1 - парсинг, 2 - тест: ").strip()
         if choice == "1":
-            messages = await get_new_messages(limit_per_chat=30)
-            print(f"\n📬 Найдено релевантных сообщений: {len(messages)}")
-            for i, msg in enumerate(messages[:5], 1):
-                print(f"\n{i}. 🔹 {msg['chat_title']}")
-                print(f"   📝 {msg['message_text'][:100]}...")
-                
+            msgs = await get_new_messages()
+            print(f"\nНайдено: {len(msgs)}")
         elif choice == "2":
-            chat_link = input("\nВведите ссылку на чат: ").strip()
-            if chat_link:
-                await test_filter(chat_link, limit=30)
+            link = input("Ссылка на чат: ").strip()
+            await test_filter(link)
     
-    try:
-        asyncio.run(main_test())
-    except KeyboardInterrupt:
-        print("\n👋 Прервано пользователем")
+    asyncio.run(main())
