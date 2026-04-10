@@ -1,6 +1,7 @@
 # parser.py
 import asyncio
 import logging
+import os
 from telethon import TelegramClient
 from config import API_ID, API_HASH, TARGET_CHATS, KEYWORDS, EXCLUDE_WORDS
 from db import is_message_sent, mark_message_sent
@@ -9,7 +10,8 @@ logging.basicConfig(level=logging.INFO)
 
 async def get_new_messages():
     client = TelegramClient('user_session', API_ID, API_HASH)
-    await client.start()
+    phone = os.getenv("PHONE_NUMBER")
+    await client.start(phone=phone)
     logging.info("Telethon client started")
 
     results = []
