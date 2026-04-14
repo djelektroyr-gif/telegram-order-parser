@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import re
+from datetime import datetime
 from telethon import TelegramClient, errors
 from config import (
     API_ID, API_HASH, TARGET_CHATS,
@@ -11,6 +12,73 @@ from db import is_message_sent, mark_message_sent
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+LAST_DEBUG_STATS = {
+    "started_at": None,
+    "finished_at": None,
+    "chats_total": 0,
+    "chats_ok": 0,
+    "chats_failed": 0,
+    "messages_scanned": 0,
+    "already_sent": 0,
+    "no_text": 0,
+    "non_relevant": 0,
+    "matched": 0,
+    "errors": 0,
+    "reasons": {},
+    "errors_by_chat": {},
+}
+
+
+def _iso_now() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _new_stats() -> dict:
+    return {
+        "started_at": _iso_now(),
+        "finished_at": None,
+        "chats_total": len(TARGET_CHATS),
+        "chats_ok": 0,
+        "chats_failed": 0,
+        "messages_scanned": 0,
+        "already_sent": 0,
+        "no_text": 0,
+        "non_relevant": 0,
+        "matched": 0,
+        "errors": 0,
+        "reasons": {},
+        "errors_by_chat": {},
+    }
+
+
+def get_last_debug_report() -> str:
+    s = LAST_DEBUG_STATS
+    if not s.get("started_at"):
+        return "ℹ️ Отладочных данных пока нет. Запустите /check_now или дождитесь авто-проверки."
+    lines = [
+        "🧪 Последний прогон парсера:",
+        f"Старт: {s.get('started_at')}",
+        f"Финиш: {s.get('finished_at') or 'в процессе'}",
+        f"Чатов: {s.get('chats_ok', 0)}/{s.get('chats_total', 0)} успешно, ошибок: {s.get('chats_failed', 0)}",
+        f"Сообщений просмотрено: {s.get('messages_scanned', 0)}",
+        f"Совпадений найдено: {s.get('matched', 0)}",
+        f"Отсеяно: {s.get('non_relevant', 0)} | без текста: {s.get('no_text', 0)} | уже отправлено: {s.get('already_sent', 0)}",
+        f"Локальных ошибок: {s.get('errors', 0)}",
+    ]
+    reasons = s.get("reasons") or {}
+    if reasons:
+        top = sorted(reasons.items(), key=lambda x: x[1], reverse=True)[:5]
+        lines.append("Топ причин фильтра:")
+        for reason, count in top:
+            lines.append(f"- {reason}: {count}")
+    chat_errors = s.get("errors_by_chat") or {}
+    if chat_errors:
+        lines.append("Ошибки по чатам:")
+        for chat, count in sorted(chat_errors.items(), key=lambda x: x[1], reverse=True)[:5]:
+            lines.append(f"- {chat}: {count}")
+    return "\n".join(lines)
+
 
 def is_helper_message(text: str) -> tuple[bool, str, list]:
     """
@@ -97,6 +165,8 @@ async def safe_get_entity(client: TelegramClient, chat_link: str):
         return None
 
 async def get_new_messages(limit_per_chat: int = 30) -> list:
+    global LAST_DEBUG_STATS
+    LAST_DEBUG_STATS = _new_stats()
     client = TelegramClient('user_session', API_ID, API_HASH)
     all_results = []
     
@@ -110,43 +180,63 @@ async def get_new_messages(limit_per_chat: int = 30) -> list:
         for chat_link in TARGET_CHATS:
             entity = await safe_get_entity(client, chat_link)
             if not entity:
+                LAST_DEBUG_STATS["chats_failed"] += 1
+                LAST_DEBUG_STATS["errors_by_chat"][chat_link] = LAST_DEBUG_STATS["errors_by_chat"].get(chat_link, 0) + 1
                 continue
             
             chat_title = getattr(entity, 'title', None) or 'Без названия'
             chat_id = str(entity.id)
+            LAST_DEBUG_STATS["chats_ok"] += 1
             
             async for message in client.iter_messages(entity, limit=limit_per_chat):
-                if not message.text:
+                try:
+                    LAST_DEBUG_STATS["messages_scanned"] += 1
+                    if not message.text:
+                        LAST_DEBUG_STATS["no_text"] += 1
+                        continue
+
+                    message_id = str(message.id)
+
+                    # Проверяем, не обработано ли уже
+                    if is_message_sent(message_id, chat_id):
+                        LAST_DEBUG_STATS["already_sent"] += 1
+                        continue
+
+                    # СТРОГАЯ ПРОВЕРКА НА ХЕЛПЕРА
+                    is_relevant, reason, keywords = is_helper_message(message.text)
+                    LAST_DEBUG_STATS["reasons"][reason] = LAST_DEBUG_STATS["reasons"].get(reason, 0) + 1
+
+                    if not is_relevant:
+                        LAST_DEBUG_STATS["non_relevant"] += 1
+                        continue
+
+                    cleaned_text = clean_message_text(message.text)
+                    message_link = get_message_link(entity.id, message.id)
+
+                    result = {
+                        "chat_title": chat_title,
+                        "message_text": cleaned_text,
+                        "message_link": message_link,
+                        "keywords": keywords[:5],
+                        "reason": reason,
+                    }
+                    all_results.append(result)
+                    LAST_DEBUG_STATS["matched"] += 1
+
+                    mark_message_sent(message_id, chat_id)
+                    logger.info(f"✅ {chat_title}: {cleaned_text[:60]}... (причина: {reason})")
+
+                    await asyncio.sleep(0.3)
+                except Exception as e:
+                    LAST_DEBUG_STATS["errors"] += 1
+                    LAST_DEBUG_STATS["errors_by_chat"][chat_title] = LAST_DEBUG_STATS["errors_by_chat"].get(chat_title, 0) + 1
+                    logger.warning(
+                        "⚠️ Пропущено сообщение chat=%s id=%s: %s",
+                        chat_title,
+                        getattr(message, "id", "?"),
+                        e,
+                    )
                     continue
-                
-                message_id = str(message.id)
-                
-                # Проверяем, не обработано ли уже
-                if is_message_sent(message_id, chat_id):
-                    continue
-                
-                # СТРОГАЯ ПРОВЕРКА НА ХЕЛПЕРА
-                is_relevant, reason, keywords = is_helper_message(message.text)
-                
-                if not is_relevant:
-                    continue
-                
-                cleaned_text = clean_message_text(message.text)
-                message_link = get_message_link(entity.id, message.id)
-                
-                result = {
-                    "chat_title": chat_title,
-                    "message_text": cleaned_text,
-                    "message_link": message_link,
-                    "keywords": keywords[:5],
-                    "reason": reason,
-                }
-                all_results.append(result)
-                
-                mark_message_sent(message_id, chat_id)
-                logger.info(f"✅ {chat_title}: {cleaned_text[:60]}... (причина: {reason})")
-                
-                await asyncio.sleep(0.3)
             
             await asyncio.sleep(2)
         
@@ -155,6 +245,7 @@ async def get_new_messages(limit_per_chat: int = 30) -> list:
     except Exception as e:
         logger.error(f"❌ Ошибка: {e}")
     finally:
+        LAST_DEBUG_STATS["finished_at"] = _iso_now()
         if client.is_connected():
             await client.disconnect()
     

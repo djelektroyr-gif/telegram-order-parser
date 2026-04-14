@@ -4,7 +4,7 @@ import logging
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from db import init_db
-from parser import get_new_messages
+from parser import get_new_messages, get_last_debug_report
 from config import BOT_TOKEN, YOUR_USER_ID
 
 # Настройка логирования
@@ -41,7 +41,8 @@ async def start_cmd(message: types.Message):
         "👋 Бот запущен!\n\n"
         "Команды:\n"
         "/check_now - Проверить новые заказы\n"
-        "/status - Статус бота"
+        "/status - Статус бота\n"
+        "/debug_last - Отчёт последнего прогона парсера"
     )
 
 @dp.message(Command("status"))
@@ -100,6 +101,14 @@ async def check_now_cmd(message: types.Message):
     except Exception as e:
         logger.error(f"Ошибка в check_now_cmd: {e}")
         await status_msg.edit_text(f"❌ Ошибка при проверке: {str(e)[:100]}")
+
+
+@dp.message(Command("debug_last"))
+async def debug_last_cmd(message: types.Message):
+    if message.from_user.id != YOUR_USER_ID:
+        await message.answer("⛔ У вас нет прав.")
+        return
+    await message.answer(get_last_debug_report())
 
 async def periodic_check():
     """Автоматическая проверка каждые 5 минут"""
